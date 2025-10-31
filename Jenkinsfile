@@ -58,18 +58,25 @@ pipeline {
       }
     }
 
-    stage('Deploy to EC2 via SSM') {
-      steps {
-        script {
-          def targets = env.SSM_TARGETS.split(',')
-          for (t in targets) {
-            echo "Deploying to ${t} ..."
-            sh '''
-              aws ssm send-command \
-                --document-name "AWS-RunShellScript" \
-                --comment "Deploy ${ECR_IMAGE}:${IMAGE_TAG} to ''' + t + '''" \
-                --targets "Key=tag:Name,Values=''' + t + '''" \
-                --parameters commands=["set -euxo pipefail",\
+stage('Deploy to EC2 via SSM') {
+  steps {
+    script {
+      def targets = env.SSM_TARGETS.split(',')
+      for (t in targets) {
+        echo "Deploying to ${t} ..."
+
+        // 100자 제한 대응: 짧은 코멘트 생성(길면 99자로 자름)
+        def shortComment = "Deploy ${env.SERVICE_NAME}:${env.IMAGE_TAG} -> ${t}"
+        if (shortComment.length() > 99) {
+          shortComment = shortComment.take(99)
+        }
+
+        sh '''
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --comment "''' + shortComment + '''" \
+            --targets "Key=tag:Name,Values=''' + t + '''" \
+            --parameters commands=["set -euxo pipefail",\
 "echo --- Deploying on \\$(hostname) ---",\
 "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com",\
 "mkdir -p ${SERVICE_DIR}",\
@@ -80,15 +87,16 @@ pipeline {
 "docker run -d --name ${SERVICE_NAME} -p ${HOST_PORT}:${CONTAINER_PORT} -e TZ=${TZ} --restart always ${ECR_IMAGE}:${LATEST_TAG}",\
 "docker image prune -f",\
 "echo --- Deployment on \\$(hostname) complete ---"] \
-                --max-errors 0 \
-                --timeout-seconds 900 \
-                --region "${AWS_REGION}" \
-                --output text > /dev/null
-            '''
-          }
-        }
+            --max-errors 0 \
+            --timeout-seconds 900 \
+            --region "${AWS_REGION}" \
+            --output text > /dev/null
+        '''
       }
     }
+  }
+}
+
   }
 
   post {
