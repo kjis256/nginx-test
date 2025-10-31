@@ -63,42 +63,75 @@ pipeline {
     }
 
     stage('Deploy to EC2 via SSM') {
-          steps {
-            script {
-              def targets = env.SSM_TARGETS.split(',').collect { it.trim() }.findAll { it }
-              for (t in targets) {
-                
-                sh """
-                  aws ssm send-command \
-                    --document-name "AWS-RunShellScript" \
-                    --comment "Deploy ${ECR_IMAGE}:${IMAGE_TAG} to ${t}" \
-                    --targets "Key=tag:Name,Values=${t}" \
-                    --parameters commands='[
-                      "set -e",
-                      "echo --- Deploying on \$(hostname) ---",
-                      
-                      // [제거] Docker 설치 명령 (Terraform이 처리)
-                      
-                      // 1) ECR 로그인 (대상 서버의 IAM Role이 ECR Pull 권한 필요)
-                      "aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com",
-                      
-                      // 2) 디렉터리 생성 및 소유자 변경 (ec2-user)
-                      "sudo mkdir -p ${SERVICE_DIR} && sudo chown ec2-user:ec2-user ${SERVICE_DIR} && cd ${SERVICE_DIR}",
-                      "if [ ! -f docker-compose.yml ]; then cat > docker-compose.yml <<EOF\\nversion: \\"3.9\\"\\nservices:\\n  ${SERVICE_NAME}:\\n    image: ${ECR_IMAGE}:${LATEST_TAG}\\n    restart: always\\n    ports:\\n      - \\"${HOST_PORT}:${CONTAINER_PORT}\\"\\n    environment:\\n      - TZ=${TZ}\\nEOF\\nfi",
-                      
-                      // 3) 최신 이미지 풀 & 재기동 (docker-compose-plugin 사용)
-                      "docker compose pull",
-                      "docker compose up -d --remove-orphans",
-                      "echo --- Deployment on \$(hostname) complete ---"
-                    ]' \
-                    --max-errors 0 \
-                    --timeout-seconds 900 \
-                    --output text >/dev/null
-                """
-              }
-            }
+      steps {
+        script {
+          def targets = env.SSM_TARGETS.split(',')
+          for (t in targets) {
+            echo "Deploying to ${t} ..."
+
+            sh """
+            aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --comment "Deploy ${ECR_IMAGE}:${IMAGE_TAG} to ${t}" \
+              --targets "Key=tag:Name,Values=${t}" \
+              --parameters '{
+                "commands": [
+                  "set -euxo pipefail",
+                  "echo --- Deploying on \$(hostname) ---",
+
+                  # 1) Docker 확인 및 재설치 (Amazon Linux 2023 기준)
+                  "if ! command -v docker >/dev/null 2>&1; then",
+                  "  sudo systemctl stop docker || true",
+                  "  sudo yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine docker-compose docker-compose-plugin containerd.io || true",
+                  "  sudo yum install -y yum-utils",
+                  "  sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo",
+                  "  sudo sed -i 's/\\\\$releasever/9/g' /etc/yum.repos.d/docker-ce.repo",
+                  "  sudo yum clean all && sudo yum makecache",
+                  "  sudo yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
+                  "  sudo systemctl enable --now docker",
+                  "  sudo usermod -aG docker ec2-user || true",
+                  "fi",
+
+                  # 2) ECR 로그인
+                  "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com",
+
+                  # 3) 서비스 디렉터리 준비
+                  "sudo mkdir -p ${SERVICE_DIR}",
+                  "sudo chown ec2-user:ec2-user ${SERVICE_DIR}",
+                  "cd ${SERVICE_DIR}",
+
+                  # 4) docker-compose.yml 자동 생성 (없을 경우)
+                  "if [ ! -f docker-compose.yml ]; then",
+                  "cat > docker-compose.yml <<'EOF'",
+                  "version: '3.9'",
+                  "services:",
+                  "  ${SERVICE_NAME}:",
+                  "    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest",
+                  "    restart: always",
+                  "    ports:",
+                  "      - '${HOST_PORT}:${CONTAINER_PORT}'",
+                  "    environment:",
+                  "      - TZ=${TZ}",
+                  "EOF",
+                  "fi",
+
+                  # 5) 최신 이미지로 업데이트
+                  "docker compose pull",
+                  "docker compose up -d --remove-orphans",
+                  "docker image prune -f",
+                  "echo --- Deployment on \$(hostname) complete ---"
+                ]
+              }' \
+              --max-errors 0 \
+              --timeout-seconds 900 \
+              --region ${AWS_REGION} \
+              --output text > /dev/null
+            """
           }
         }
+      }
+    }
+
   }
 
   post {
