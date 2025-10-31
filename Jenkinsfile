@@ -21,7 +21,7 @@ pipeline {
 
     // --- 배포 타깃(SSM: Name 태그) ---
     // (Terraform의 instance.tf 태그와 일치해야 함)
-    SSM_TARGETS = 'mybalance-stg-newapp01,mybalance-stg-newapp02' // ⬅️ 'was-' 접두사 제거 (Terraform 태그 기준)
+    SSM_TARGETS = 'mybalance-stg-was-newapp01,mybalance-stg-was-newapp02' // ⬅️ 'was-' 접두사 제거 (Terraform 태그 기준)
 
     // --- 원격 서버 런타임/Compose ---
     SERVICE_NAME   = 'app'
@@ -63,46 +63,42 @@ pipeline {
     }
 
     stage('Deploy to EC2 via SSM') {
-      steps {
-        script {
-          def targets = env.SSM_TARGETS.split(',').collect { it.trim() }.findAll { it }
-          for (t in targets) {
-            
-            // ⚠️ [수정] 'withAWS' 래퍼를 제거했습니다.
-            // bs01 인스턴스의 IAM 역할(Role)이 자동으로 인증을 처리합니다.
-            // (bs01 역할에 ssm:SendCommand 권한이 필요합니다.)
-            sh """
-              aws ssm send-command \
-                --document-name "AWS-RunShellScript" \
-                --comment "Deploy ${ECR_IMAGE}:${IMAGE_TAG} to ${t}" \
-                --targets "Key=tag:Name,Values=${t}" \
-                --parameters commands='[
-                  "set -e",
-                  "echo --- Deploying on \$(hostname) ---",
-                  
-                  // 1) Docker/Compose 설치 (Ubuntu/Debian)
-                  "if ! command -v docker >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y docker.io docker-compose-plugin && sudo systemctl enable --now docker && sudo usermod -aG docker ubuntu; fi",
-                  
-                  // 2) ECR 로그인 (대상 서버의 IAM Role이 ECR Pull 권한 필요)
-                  "aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com",
-                  
-                  // 3) 서비스 디렉터리/Compose 파일 생성(없을 때만)
-                  "sudo mkdir -p ${SERVICE_DIR} && sudo chown ubuntu:ubuntu ${SERVICE_DIR} && cd ${SERVICE_DIR}",
-                  "if [ ! -f docker-compose.yml ]; then cat > docker-compose.yml <<EOF\\nversion: \\"3.9\\"\\nservices:\\n  ${SERVICE_NAME}:\\n    image: ${ECR_IMAGE}:${LATEST_TAG}\\n    restart: always\\n    ports:\\n      - \\"${HOST_PORT}:${CONTAINER_PORT}\\"\\n    environment:\\n      - TZ=${TZ}\\nEOF\\nfi",
-                  
-                  // 4) 최신 이미지 풀 & 재기동
-                  "docker compose pull",
-                  "docker compose up -d --remove-orphans",
-                  "echo --- Deployment on \$(hostname) complete ---"
-                ]' \
-                --max-errors 0 \
-                --timeout-seconds 900 \
-                --output text >/dev/null
-            """
+          steps {
+            script {
+              def targets = env.SSM_TARGETS.split(',').collect { it.trim() }.findAll { it }
+              for (t in targets) {
+                
+                sh """
+                  aws ssm send-command \
+                    --document-name "AWS-RunShellScript" \
+                    --comment "Deploy ${ECR_IMAGE}:${IMAGE_TAG} to ${t}" \
+                    --targets "Key=tag:Name,Values=${t}" \
+                    --parameters commands='[
+                      "set -e",
+                      "echo --- Deploying on \$(hostname) ---",
+                      
+                      // [제거] Docker 설치 명령 (Terraform이 처리)
+                      
+                      // 1) ECR 로그인 (대상 서버의 IAM Role이 ECR Pull 권한 필요)
+                      "aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com",
+                      
+                      // 2) 디렉터리 생성 및 소유자 변경 (ec2-user)
+                      "sudo mkdir -p ${SERVICE_DIR} && sudo chown ec2-user:ec2-user ${SERVICE_DIR} && cd ${SERVICE_DIR}",
+                      "if [ ! -f docker-compose.yml ]; then cat > docker-compose.yml <<EOF\\nversion: \\"3.9\\"\\nservices:\\n  ${SERVICE_NAME}:\\n    image: ${ECR_IMAGE}:${LATEST_TAG}\\n    restart: always\\n    ports:\\n      - \\"${HOST_PORT}:${CONTAINER_PORT}\\"\\n    environment:\\n      - TZ=${TZ}\\nEOF\\nfi",
+                      
+                      // 3) 최신 이미지 풀 & 재기동 (docker-compose-plugin 사용)
+                      "docker compose pull",
+                      "docker compose up -d --remove-orphans",
+                      "echo --- Deployment on \$(hostname) complete ---"
+                    ]' \
+                    --max-errors 0 \
+                    --timeout-seconds 900 \
+                    --output text >/dev/null
+                """
+              }
+            }
           }
         }
-      }
-    }
   }
 
   post {
