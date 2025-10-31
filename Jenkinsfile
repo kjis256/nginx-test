@@ -11,31 +11,30 @@ pipeline {
 
     // --- AWS/ECR ---
     AWS_DEFAULT_REGION = 'ap-northeast-2'
-    AWS_CREDS_ID       = 'aws-ecr' // Jenkins Credentials ID
+    // ⚠️ [제거] AWS_CREDS_ID 변수가 더 이상 필요 없습니다. (IAM Role 사용)
     ACCOUNT_ID         = '193491250091'
-    // ECR 리포지토리 (Terraform의 ecr.tf에 맞춤)
     ECR_IMAGE = "${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/mybalance-stg/app"
 
     // --- 태그 정책 ---
-    IMAGE_TAG  = "${env.BUILD_NUMBER}"  // BUILD_NUMBER 사용
+    IMAGE_TAG  = "${env.BUILD_NUMBER}"
     LATEST_TAG = "latest"
 
     // --- 배포 타깃(SSM: Name 태그) ---
-    SSM_TARGETS = 'mybalance-stg-was-newapp01,mybalance-stg-was-newapp02'
+    // (Terraform의 instance.tf 태그와 일치해야 함)
+    SSM_TARGETS = 'mybalance-stg-newapp01,mybalance-stg-newapp02' // ⬅️ 'was-' 접두사 제거 (Terraform 태그 기준)
 
     // --- 원격 서버 런타임/Compose ---
     SERVICE_NAME   = 'app'
-    SERVICE_DIR    = '/opt/app'
+    SERVICE_DIR    = '/srv/mybalance-app' // ⬅️ 이전 단계에서 합의한 경로로 수정
     CONTAINER_PORT = '80'
     HOST_PORT      = '80'
-
-    // --- 평문 환경변수 ---
     TZ = 'Asia/Seoul'
   }
 
   stages {
     stage('Checkout') {
       steps {
+        // (Public Repo라 Credentials 불필요)
         git branch: env.GIT_BRANCH, url: env.GIT_REPO_URL
       }
     }
@@ -51,15 +50,15 @@ pipeline {
 
     stage('ECR Login & Push') {
       steps {
-        withAWS(region: env.AWS_DEFAULT_REGION, credentials: env.AWS_CREDS_ID) {
-          sh """
-            aws ecr get-login-password --region ${AWS_DEFAULT_REGION} \
-              | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+        // ⚠️ [수정] 'withAWS' 래퍼를 제거했습니다.
+        // bs01 인스턴스의 IAM 역할(Role)이 자동으로 인증을 처리합니다.
+        sh """
+          aws ecr get-login-password --region ${AWS_DEFAULT_REGION} \
+            | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
 
-            docker push ${ECR_IMAGE}:${IMAGE_TAG}
-            docker push ${ECR_IMAGE}:${LATEST_TAG}
-          """
-        }
+          docker push ${ECR_IMAGE}:${IMAGE_TAG}
+          docker push ${ECR_IMAGE}:${LATEST_TAG}
+        """
       }
     }
 
@@ -68,30 +67,38 @@ pipeline {
         script {
           def targets = env.SSM_TARGETS.split(',').collect { it.trim() }.findAll { it }
           for (t in targets) {
-            withAWS(region: env.AWS_DEFAULT_REGION, credentials: env.AWS_CREDS_ID) {
-              sh """
-                aws ssm send-command \
-                  --document-name "AWS-RunShellScript" \
-                  --comment "Deploy ${ECR_IMAGE}:${IMAGE_TAG} to ${t}" \
-                  --targets "Key=tag:Name,Values=${t}" \
-                  --parameters commands='[
-                    "set -e",
-                    // 1) Docker/Compose 설치 및 기동 (Amazon Linux 2023 우선, 없으면 Debian/Ubuntu 분기)
-                    "if command -v dnf >/dev/null 2>&1; then sudo dnf -y install docker docker-compose-plugin || true; sudo systemctl enable --now docker; else sudo apt-get update -y; sudo apt-get install -y docker.io docker-compose-plugin; sudo systemctl enable --now docker; fi",
-                    // 2) ECR 로그인
-                    "aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com",
-                    // 3) 서비스 디렉터리/Compose 파일 생성(없을 때만)
-                    "sudo mkdir -p ${SERVICE_DIR} && cd ${SERVICE_DIR}",
-                    "if [ ! -f docker-compose.yml ]; then cat > docker-compose.yml <<'EOF'\\nversion: \\"3.9\\"\\nservices:\\n  ${SERVICE_NAME}:\\n    image: ${ECR_IMAGE}:${LATEST_TAG}\\n    restart: always\\n    ports:\\n      - \\"${HOST_PORT}:${CONTAINER_PORT}\\"\\n    environment:\\n      - TZ=${TZ}\\nEOF\\nfi",
-                    // 4) 최신 이미지 풀 & 재기동
-                    "docker compose pull",
-                    "docker compose up -d"
-                  ]' \
-                  --max-errors 0 \
-                  --timeout-seconds 900 \
-                  --output text >/dev/null
-              """
-            }
+            
+            // ⚠️ [수정] 'withAWS' 래퍼를 제거했습니다.
+            // bs01 인스턴스의 IAM 역할(Role)이 자동으로 인증을 처리합니다.
+            // (bs01 역할에 ssm:SendCommand 권한이 필요합니다.)
+            sh """
+              aws ssm send-command \
+                --document-name "AWS-RunShellScript" \
+                --comment "Deploy ${ECR_IMAGE}:${IMAGE_TAG} to ${t}" \
+                --targets "Key=tag:Name,Values=${t}" \
+                --parameters commands='[
+                  "set -e",
+                  "echo --- Deploying on \$(hostname) ---",
+                  
+                  // 1) Docker/Compose 설치 (Ubuntu/Debian)
+                  "if ! command -v docker >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y docker.io docker-compose-plugin && sudo systemctl enable --now docker && sudo usermod -aG docker ubuntu; fi",
+                  
+                  // 2) ECR 로그인 (대상 서버의 IAM Role이 ECR Pull 권한 필요)
+                  "aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com",
+                  
+                  // 3) 서비스 디렉터리/Compose 파일 생성(없을 때만)
+                  "sudo mkdir -p ${SERVICE_DIR} && sudo chown ubuntu:ubuntu ${SERVICE_DIR} && cd ${SERVICE_DIR}",
+                  "if [ ! -f docker-compose.yml ]; then cat > docker-compose.yml <<EOF\\nversion: \\"3.9\\"\\nservices:\\n  ${SERVICE_NAME}:\\n    image: ${ECR_IMAGE}:${LATEST_TAG}\\n    restart: always\\n    ports:\\n      - \\"${HOST_PORT}:${CONTAINER_PORT}\\"\\n    environment:\\n      - TZ=${TZ}\\nEOF\\nfi",
+                  
+                  // 4) 최신 이미지 풀 & 재기동
+                  "docker compose pull",
+                  "docker compose up -d --remove-orphans",
+                  "echo --- Deployment on \$(hostname) complete ---"
+                ]' \
+                --max-errors 0 \
+                --timeout-seconds 900 \
+                --output text >/dev/null
+            """
           }
         }
       }
@@ -101,5 +108,9 @@ pipeline {
   post {
     success { echo "✅ 성공: ${ECR_IMAGE}:${IMAGE_TAG} 배포 완료" }
     failure { echo "❌ 실패: 로그 확인 필요" }
+    always {
+      // ECR 로그아웃 (보안)
+      sh "docker logout ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+    }
   }
 }
