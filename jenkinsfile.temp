@@ -1,0 +1,155 @@
+// --- Jenkinsfile (mybalance-stg/app) ---
+
+pipeline {
+    // Jenkins 컨테이너 자체에서 실행 (Docker-out-of-Docker)
+    agent any
+
+    environment {
+        // --- 1. AWS 환경 변수 ---
+        // ⚠️ AWS_ACCOUNT_ID를 본인의 12자리 숫자로 수정하세요.
+        AWS_ACCOUNT_ID   = "193491250091" 
+        AWS_REGION       = "ap-northeast-2"
+        
+        // --- 2. ECR 정보 (ecr.tf에서 생성한 이름) ---
+        APP_REPO_NAME    = "mybalance-stg/app"
+        ECR_REGISTRY     = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        
+        // --- 3. 배포할 이미지 태그 ---
+        IMAGE_TAG        = "stg-${BUILD_NUMBER}" // 빌드 번호 (예: stg-10)
+        LATEST_TAG       = "latest" // latest 태그
+    }
+
+    stages {
+        // --- 1. Git 소스 코드 가져오기 ---
+        stage('Checkout') {
+            steps {
+                // Jenkins Credentials에 등록한 'github-credentials' ID 사용
+                git credentialsId: 'github-credentials', 
+                    // ⚠️ GitHub 저장소 URL을 수정하세요.
+                    url: 'https://github.com/kjis256/nginx-test', 
+                    branch: 'main'
+            }
+        }
+
+        // --- 2. Docker 이미지 빌드 ---
+        stage('Build Image') {
+            steps {
+                script {
+                    echo "--- Building Image: ${ECR_REGISTRY}/${APP_REPO_NAME}:${IMAGE_TAG} ---"
+                    // docker-workflow 플러그인 사용
+                    def dockerImage = docker.build(
+                        "${ECR_REGISTRY}/${APP_REPO_NAME}:${IMAGE_TAG}", 
+                        "." // 'Dockerfile'이 있는 현재 디렉터리
+                    )
+                    
+                    // 'latest' 태그도 추가
+                    dockerImage.addTag("${ECR_REGISTRY}/${APP_REPO_NAME}:${LATEST_TAG}")
+                }
+            }
+        }
+
+        // --- 3. ECR (AWS) 인증 및 푸시 ---
+        stage('Push to ECR') {
+            steps {
+                script {
+                    echo "--- Logging in to ECR (${ECR_REGISTRY}) ---"
+                    // bs01 인스턴스의 IAM 역할을 사용하여 ECR에 자동 로그인
+                    // (Jenkins Dockerfile에 AWS CLI가 설치되어 있어야 함)
+                    sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | \
+                    docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    """
+                    
+                    echo "--- Pushing Image (Tag: ${IMAGE_TAG}) ---"
+                    sh "docker push ${ECR_REGISTRY}/${APP_REPO_NAME}:${IMAGE_TAG}"
+                    
+                    echo "--- Pushing Image (Tag: ${LATEST_TAG}) ---"
+                    sh "docker push ${ECR_REGISTRY}/${APP_REPO_NAME}:${LATEST_TAG}"
+                }
+            }
+        }
+
+        // --- 4. STG 서버에 배포 (SSM & SSH) ---
+        stage('Deploy to STG Servers') {
+            steps {
+                script {
+                    // ⚠️ 배포할 App/NewApp 서버의 Private IP로 수정하세요.
+                    def targetServers = [
+                        "10.1.1.20", // newapp01 Private IP
+                        "10.1.2.20"  // newapp02 Private IP
+                    ]
+                    
+                    // 임시 .pem 파일 이름 정의
+                    def tmpKeyFile = ".stg-key-${BUILD_NUMBER}.pem"
+
+                    try {
+                        echo "--- Fetching SSH Key from SSM Parameter Store ---"
+                        // 1. AWS CLI로 SSM에서 키를 가져와 임시 파일로 저장
+                        sh """
+                        aws ssm get-parameter --name "/stg/ec2/ssh-key" \
+                            --with-decryption \
+                            --query "Parameter.Value" \
+                            --output text > ${tmpKeyFile}
+                        """
+                        
+                        // 2. 파일 권한을 600(소유자만 읽기)으로 변경 (SSH 필수)
+                        sh "chmod 600 ${tmpKeyFile}"
+
+                        // 3. 'sshagent'가 임시 키 파일을 사용하도록 함
+                        sshagent(credentials: [sshUserPrivateKey(
+                            keyFile: tmpKeyFile,
+                            username: 'ubuntu',
+                            credentialsId: 'ssm-stg-key' // 이 작업에서만 사용할 임의의 ID
+                        )]) {
+                            echo "--- Deploying to servers: ${targetServers.join(', ')} ---"
+                            // parallel: 여러 서버에 동시에 배포
+                            parallel targetServers.collectEntries { ip ->
+                                ["Deploy to ${ip}": {
+                                    sh """
+                                    ssh -o StrictHostKeyChecking=no ubuntu@${ip} '
+                                        echo "--- Deploying on ${ip} ---"
+                                        
+                                        # ⚠️ 배포 폴더 경로 (미리 생성되어 있어야 함)
+                                        cd /srv/mybalance-app
+                                        
+                                        # ECR에서 최신 이미지(latest) 받아오기
+                                        docker-compose pull
+                                        
+                                        # 새 이미지로 컨테이너 띄우기 (무중단)
+                                        docker-compose up -d --remove-orphans
+                                        
+                                        echo "--- Deployment on ${ip} complete ---"
+                                    '
+                                    """
+                                }]
+                            }
+                        } // sshagent
+                        
+                    } finally {
+                        // 4. 파이프라인 성공/실패 여부와 관계없이 임시 .pem 키 파일 삭제
+                        echo "--- Cleaning up temporary key file ---"
+                        sh "rm -f ${tmpKeyFile}"
+                    }
+                } // script
+            } // steps
+        } // stage
+    } // stages
+    
+    // --- 5. 파이프라인 완료 후 정리 ---
+    post {
+        always {
+            // Jenkins 디스크 공간 확보
+            echo "--- Cleaning up workspace and logging out ---"
+            cleanWs()
+            
+            // ECR 로그아웃 (보안)
+            sh "docker logout ${ECR_REGISTRY}"
+        }
+        success {
+            echo "Pipeline Succeeded."
+        }
+        failure {
+            echo "Pipeline Failed."
+        }
+    }
+}
