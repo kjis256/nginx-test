@@ -20,7 +20,7 @@ pipeline {
     LATEST_TAG  = "latest"
 
     // --- 배포 타깃(SSM: Name 태그) ---
-    SSM_TARGETS = 'mybalance-stg-was-newapp01,mybalance-stg-was-newapp02'
+    SSM_TARGETS = 'mybalance-stg-app01,mybalance-stg-app02'
 
     // --- 런타임 설정 ---
     SERVICE_NAME   = 'app'
